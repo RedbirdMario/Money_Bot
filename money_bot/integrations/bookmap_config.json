@@ -1,0 +1,7 @@
+{
+    "strategy": "double_ema",
+    "interval": 60,
+    "max_candles": 500,
+    "params": {},
+    "log_level": "DEBUG"
+}

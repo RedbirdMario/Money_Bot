@@ -202,6 +202,9 @@ class BookmapAddon:
             detach_instrument_handler=self._on_instrument_detached,
         )
 
+        # Block until Bookmap turns off the addon
+        bm.wait_until_addon_is_turned_off(addon)
+
     # ------------------------------------------------------------------
     # Bookmap event handlers
     # ------------------------------------------------------------------
@@ -270,7 +273,7 @@ class BookmapAddon:
 
         logger.info("Subscribed to %s (pips=%s, crypto=%s)", full_name, pips, is_crypto)
 
-    def _on_instrument_detached(self, alias):
+    def _on_instrument_detached(self, addon, alias):
         """Called when instrument is unsubscribed."""
         logger.info("Instrument detached: %s", alias)
         candle = self.aggregator.flush()
@@ -279,7 +282,7 @@ class BookmapAddon:
         self._alias = None
         self.strategy = None
 
-    def _on_indicator_response(self, req_id, indicator_id):
+    def _on_indicator_response(self, addon, req_id, indicator_id):
         """Bookmap confirms indicator registration with the real indicator_id."""
         self._indicator_ids[req_id] = indicator_id
         if req_id == REQ_SIGNAL_INDICATOR:
@@ -289,7 +292,7 @@ class BookmapAddon:
             self._indicator_pnl_id = indicator_id
             logger.info("PnL indicator registered: id=%d", indicator_id)
 
-    def _on_setting_change(self, alias, setting_name, field_type, new_value):
+    def _on_setting_change(self, addon, alias, setting_name, field_type, new_value):
         """Called when user changes a setting in Bookmap UI."""
         logger.info("Setting changed: %s = %s (%s)", setting_name, new_value, field_type)
 
@@ -326,7 +329,7 @@ class BookmapAddon:
             except (json.JSONDecodeError, KeyError) as exc:
                 logger.error("Failed to update params: %s", exc)
 
-    def _on_trade(self, alias, price, size, is_otc, is_bid, is_execution_start,
+    def _on_trade(self, addon, alias, price, size, is_otc, is_bid, is_execution_start,
                   is_execution_end, aggressor_order_id, passive_order_id):
         """Called on every trade tick from Bookmap."""
         if alias != self._alias:
@@ -338,7 +341,7 @@ class BookmapAddon:
         if candle is not None:
             self._pending_candles.append(candle)
 
-    def _on_interval(self):
+    def _on_interval(self, addon, alias):
         """Called every ~100ms by Bookmap. Process any finished candles and run strategy."""
         if self.strategy is None or not self._pending_candles:
             return

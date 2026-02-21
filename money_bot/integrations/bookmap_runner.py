@@ -1,78 +1,91 @@
-"""Standalone runner to start the Bookmap addon.
+"""Bookmap Python Addon runner for Money_Bot.
 
-Usage::
+Bookmap launches this script with a socket port as sys.argv[1].
+Configuration is done via environment variables or a JSON config file.
 
-    python -m money_bot.integrations.bookmap_runner --strategy double_ema --interval 3600
-    python -m money_bot.integrations.bookmap_runner --strategy rsi_mean_reversion --params '{"rsi_period": 14}'
+Usage — register this script path in Bookmap's Python API addon manager:
+    /Users/marionakowitz/Projects/Money_Bot/money_bot/integrations/bookmap_runner.py
+
+Configure via environment variables:
+    export MB_STRATEGY=double_ema
+    export MB_INTERVAL=60
+    export MB_MAX_CANDLES=500
+    export MB_PARAMS='{"fast_period": 20}'
+    export MB_LOG_LEVEL=DEBUG
+
+Or via config file (auto-detected next to this script):
+    money_bot/integrations/bookmap_config.json
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
+import os
 import sys
+from pathlib import Path
 
 from money_bot.integrations.bookmap_addon import BookmapAddon
 
+# Config file path (same directory as this script)
+CONFIG_FILE = Path(__file__).parent / "bookmap_config.json"
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(
-        description="Money_Bot Bookmap Addon — draw strategy signals on the heatmap",
-    )
-    parser.add_argument(
-        "--strategy",
-        default="double_ema",
-        help="Strategy name from the registry (default: double_ema)",
-    )
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=3600,
-        help="Candle interval in seconds (default: 3600 = 1h)",
-    )
-    parser.add_argument(
-        "--max-candles",
-        type=int,
-        default=500,
-        help="Max candles to keep in rolling buffer (default: 500)",
-    )
-    parser.add_argument(
-        "--params",
-        default="{}",
-        help='Strategy parameters as JSON string (default: "{}")',
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level (default: INFO)",
-    )
 
-    args = parser.parse_args(argv)
+def _load_config() -> dict:
+    """Load config from JSON file, then override with environment variables."""
+    config = {
+        "strategy": "double_ema",
+        "interval": 3600,
+        "max_candles": 500,
+        "params": {},
+        "log_level": "INFO",
+    }
+
+    # Load from config file if it exists
+    if CONFIG_FILE.exists():
+        try:
+            with open(CONFIG_FILE) as f:
+                file_config = json.load(f)
+            config.update(file_config)
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"Warning: Could not read {CONFIG_FILE}: {exc}", file=sys.stderr)
+
+    # Environment variables override file config
+    if os.environ.get("MB_STRATEGY"):
+        config["strategy"] = os.environ["MB_STRATEGY"]
+    if os.environ.get("MB_INTERVAL"):
+        config["interval"] = int(os.environ["MB_INTERVAL"])
+    if os.environ.get("MB_MAX_CANDLES"):
+        config["max_candles"] = int(os.environ["MB_MAX_CANDLES"])
+    if os.environ.get("MB_PARAMS"):
+        config["params"] = json.loads(os.environ["MB_PARAMS"])
+    if os.environ.get("MB_LOG_LEVEL"):
+        config["log_level"] = os.environ["MB_LOG_LEVEL"]
+
+    return config
+
+
+def main() -> None:
+    config = _load_config()
 
     logging.basicConfig(
-        level=getattr(logging, args.log_level),
+        level=getattr(logging, config["log_level"]),
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    logger = logging.getLogger(__name__)
 
-    try:
-        params = json.loads(args.params)
-    except json.JSONDecodeError as exc:
-        print(f"Error: Invalid JSON in --params: {exc}", file=sys.stderr)
-        sys.exit(1)
-
-    addon = BookmapAddon(
-        strategy_name=args.strategy,
-        strategy_params=params,
-        interval_seconds=args.interval,
-        max_candles=args.max_candles,
+    logger.info(
+        "Starting Bookmap addon: strategy=%s interval=%ds max_candles=%d",
+        config["strategy"],
+        config["interval"],
+        config["max_candles"],
     )
 
-    logging.getLogger(__name__).info(
-        "Starting Bookmap addon: strategy=%s interval=%ds",
-        args.strategy,
-        args.interval,
+    addon = BookmapAddon(
+        strategy_name=config["strategy"],
+        strategy_params=config["params"],
+        interval_seconds=config["interval"],
+        max_candles=config["max_candles"],
     )
     addon.start()
 

@@ -1,10 +1,14 @@
-"""Bookmap Python Addon — streams live signals from Money_Bot strategies onto the heatmap."""
+"""Bookmap Python Addon — streams live signals from Money_Bot strategies onto the heatmap.
+
+Uses the real bookmap Python API (pip install bookmap).
+API reference: https://github.com/niceprice/bookmap-python-api
+"""
 
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+import time
 from typing import Any
 
 import pandas as pd
@@ -14,11 +18,15 @@ from money_bot.types import Signal, SignalType, Side
 
 logger = logging.getLogger(__name__)
 
-# Bookmap colors (ARGB int format)
-GREEN = 0xFF00CC00
-RED = 0xFFCC0000
-WHITE = 0xFFFFFFFF
-CYAN = 0xFF00CCCC
+# Bookmap colors as RGB tuples
+COLOR_GREEN = (0, 204, 0)
+COLOR_RED = (204, 0, 0)
+COLOR_WHITE = (255, 255, 255)
+COLOR_CYAN = (0, 204, 204)
+
+# Indicator request IDs (arbitrary, used to map responses)
+REQ_SIGNAL_INDICATOR = 1
+REQ_PNL_INDICATOR = 2
 
 # ---------------------------------------------------------------------------
 # CandleAggregator — builds OHLCV candles from individual trade ticks
@@ -141,27 +149,29 @@ class BookmapAddon:
         self.strategy_name = strategy_name
         self.strategy_params = strategy_params or {}
         self.interval_seconds = interval_seconds
+        self.max_candles = max_candles
 
         # Core components
         self.aggregator = CandleAggregator(interval_seconds)
         self.buffer = CandleBuffer(max_candles)
 
-        # Strategy (loaded lazily in on_subscribe so settings can override)
+        # Strategy (loaded on instrument subscribe)
         self.strategy = None
 
-        # Pending candles produced by add_tick (consumed by _on_interval)
+        # Pending candles produced by trade handler (consumed by interval handler)
         self._pending_candles: list[dict] = []
 
         # Signal tracking for diff logic
         self._prev_signal_count: int = 0
-        self._cumulative_pnl: float = 0.0
 
         # Bookmap handles
-        self._addon = None
+        self._addon: dict | None = None
         self._alias: str | None = None
         self._pips: float = 1.0
-        self._indicator_heatmap: int | None = None
-        self._indicator_pnl: int | None = None
+        self._indicator_signal_id: int | None = None
+        self._indicator_pnl_id: int | None = None
+        # Map req_id -> resolved indicator_id
+        self._indicator_ids: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -177,101 +187,159 @@ class BookmapAddon:
             )
 
         addon = bm.create_addon()
-
-        # Register settings UI
-        bm.add_number_setting(addon, "interval", "Candle Interval (sec)", self.interval_seconds)
-        bm.add_string_setting(addon, "strategy", "Strategy Name", self.strategy_name)
-        bm.add_number_setting(addon, "max_candles", "Max Candles Buffer", self.buffer.max_candles)
-        bm.add_string_setting(addon, "params_json", "Strategy Params (JSON)", json.dumps(self.strategy_params))
-
-        # Register event handlers
-        bm.on_subscribe(addon, self._on_subscribe)
-        bm.on_unsubscribe(addon, self._on_unsubscribe)
-        bm.on_interval(addon, self._on_interval)
-
         self._addon = addon
-        bm.start_addon(addon)
+
+        # Register global handlers
+        bm.add_trades_handler(addon, self._on_trade)
+        bm.add_on_interval_handler(addon, self._on_interval)
+        bm.add_indicator_response_handler(addon, self._on_indicator_response)
+        bm.add_on_setting_change_handler(addon, self._on_setting_change)
+
+        # Start addon — Bookmap calls add_instrument_handler when an instrument is subscribed
+        bm.start_addon(
+            addon,
+            add_instrument_handler=self._on_instrument_added,
+            detach_instrument_handler=self._on_instrument_detached,
+        )
 
     # ------------------------------------------------------------------
     # Bookmap event handlers
     # ------------------------------------------------------------------
 
-    def _on_subscribe(self, addon, alias, instrument_name, is_crypto, pips, size_multiplier):
+    def _on_instrument_added(self, addon, alias, full_name, is_crypto, pips,
+                              size_multiplier, instrument_multiplier, supported_features):
+        """Called when Bookmap subscribes to an instrument."""
         import bookmap as bm
 
         self._alias = alias
         self._pips = pips
 
-        # Read settings (may have been changed in Bookmap UI)
-        interval_val = bm.get_setting(addon, "interval")
-        if interval_val is not None:
-            self.aggregator = CandleAggregator(int(interval_val))
-
-        strategy_val = bm.get_setting(addon, "strategy")
-        if strategy_val is not None:
-            self.strategy_name = strategy_val
-
-        max_candles_val = bm.get_setting(addon, "max_candles")
-        if max_candles_val is not None:
-            self.buffer = CandleBuffer(int(max_candles_val))
-
-        params_val = bm.get_setting(addon, "params_json")
-        if params_val:
-            try:
-                self.strategy_params = json.loads(params_val)
-            except json.JSONDecodeError:
-                logger.warning("Invalid params JSON: %s — using defaults", params_val)
+        # Reset state for new instrument
+        self.aggregator = CandleAggregator(self.interval_seconds)
+        self.buffer = CandleBuffer(self.max_candles)
+        self._pending_candles.clear()
+        self._prev_signal_count = 0
 
         # Load strategy
         cls = get_strategy_class(self.strategy_name)
         self.strategy = cls.from_params(self.strategy_params)
         logger.info("Loaded strategy: %s with params %s", self.strategy_name, self.strategy_params)
 
-        # Register indicators
-        self._indicator_heatmap = bm.register_indicator(
-            addon,
-            alias,
-            bm.IndicatorConfig(
-                name=f"MB:{self.strategy_name}",
-                indicator_type=bm.IndicatorType.PRIMARY,
-                line_style=bm.LineStyle.NONE,
-            ),
+        # Register settings UI
+        bm.add_number_settings_parameter(
+            addon, alias, "Candle Interval (sec)",
+            default_value=float(self.interval_seconds),
+            minimum=10.0, maximum=86400.0, step=10.0,
         )
-        self._indicator_pnl = bm.register_indicator(
-            addon,
-            alias,
-            bm.IndicatorConfig(
-                name=f"MB:PnL",
-                indicator_type=bm.IndicatorType.BOTTOM,
-                line_style=bm.LineStyle.SOLID,
-                color=CYAN,
-            ),
+        bm.add_string_settings_parameter(
+            addon, alias, "Strategy Name",
+            default_value=self.strategy_name,
+        )
+        bm.add_number_settings_parameter(
+            addon, alias, "Max Candles Buffer",
+            default_value=float(self.max_candles),
+            minimum=50.0, maximum=5000.0, step=50.0,
+        )
+        bm.add_string_settings_parameter(
+            addon, alias, "Strategy Params JSON",
+            default_value=json.dumps(self.strategy_params),
         )
 
-        # Register trade handler (needs alias to be set first)
-        bm.on_trade(addon, alias, self._on_trade)
+        # Register indicators (response comes async via _on_indicator_response)
+        bm.register_indicator(
+            addon, alias,
+            req_id=REQ_SIGNAL_INDICATOR,
+            indicator_name=f"MB:{self.strategy_name}",
+            graph_type="PRIMARY",
+            color=COLOR_GREEN,
+            line_style="SOLID",
+            show_line_by_default=True,
+        )
+        bm.register_indicator(
+            addon, alias,
+            req_id=REQ_PNL_INDICATOR,
+            indicator_name="MB:PnL",
+            graph_type="BOTTOM",
+            color=COLOR_CYAN,
+            line_style="SOLID",
+            initial_value=0.0,
+        )
 
-        logger.info("Subscribed to %s (pips=%s)", instrument_name, pips)
+        # Subscribe to trade data
+        bm.subscribe_to_trades(addon, alias, req_id=0)
 
-    def _on_unsubscribe(self, addon, alias):
-        logger.info("Unsubscribed from alias %s", alias)
-        # Flush any pending candle
+        logger.info("Subscribed to %s (pips=%s, crypto=%s)", full_name, pips, is_crypto)
+
+    def _on_instrument_detached(self, alias):
+        """Called when instrument is unsubscribed."""
+        logger.info("Instrument detached: %s", alias)
         candle = self.aggregator.flush()
         if candle:
             self.buffer.append(candle)
+        self._alias = None
+        self.strategy = None
 
-    def _on_trade(self, addon, alias, price_level, size, is_otc, is_bid, is_execution_start, is_execution_end):
-        price = price_level * self._pips
-        candle = self.aggregator.add_tick(
-            timestamp_ms=int(pd.Timestamp.now(tz="UTC").timestamp() * 1000),
-            price=price,
-            size=size,
-        )
+    def _on_indicator_response(self, req_id, indicator_id):
+        """Bookmap confirms indicator registration with the real indicator_id."""
+        self._indicator_ids[req_id] = indicator_id
+        if req_id == REQ_SIGNAL_INDICATOR:
+            self._indicator_signal_id = indicator_id
+            logger.info("Signal indicator registered: id=%d", indicator_id)
+        elif req_id == REQ_PNL_INDICATOR:
+            self._indicator_pnl_id = indicator_id
+            logger.info("PnL indicator registered: id=%d", indicator_id)
+
+    def _on_setting_change(self, alias, setting_name, field_type, new_value):
+        """Called when user changes a setting in Bookmap UI."""
+        logger.info("Setting changed: %s = %s (%s)", setting_name, new_value, field_type)
+
+        if setting_name == "Candle Interval (sec)":
+            self.interval_seconds = int(new_value)
+            self.aggregator = CandleAggregator(self.interval_seconds)
+            self.buffer = CandleBuffer(self.max_candles)
+            self._pending_candles.clear()
+            self._prev_signal_count = 0
+            logger.info("Interval changed to %ds — buffers reset", self.interval_seconds)
+
+        elif setting_name == "Strategy Name":
+            self.strategy_name = str(new_value)
+            try:
+                cls = get_strategy_class(self.strategy_name)
+                self.strategy = cls.from_params(self.strategy_params)
+                self._prev_signal_count = 0
+                logger.info("Strategy changed to: %s", self.strategy_name)
+            except KeyError:
+                logger.error("Unknown strategy: %s", self.strategy_name)
+
+        elif setting_name == "Max Candles Buffer":
+            self.max_candles = int(new_value)
+            self.buffer = CandleBuffer(self.max_candles)
+            self._prev_signal_count = 0
+
+        elif setting_name == "Strategy Params JSON":
+            try:
+                self.strategy_params = json.loads(str(new_value))
+                cls = get_strategy_class(self.strategy_name)
+                self.strategy = cls.from_params(self.strategy_params)
+                self._prev_signal_count = 0
+                logger.info("Strategy params updated: %s", self.strategy_params)
+            except (json.JSONDecodeError, KeyError) as exc:
+                logger.error("Failed to update params: %s", exc)
+
+    def _on_trade(self, alias, price, size, is_otc, is_bid, is_execution_start,
+                  is_execution_end, aggressor_order_id, passive_order_id):
+        """Called on every trade tick from Bookmap."""
+        if alias != self._alias:
+            return
+
+        real_price = price * self._pips
+        now_ms = int(time.time() * 1000)
+        candle = self.aggregator.add_tick(now_ms, real_price, size)
         if candle is not None:
             self._pending_candles.append(candle)
 
-    def _on_interval(self, addon, alias):
-        """Called every 100ms by Bookmap. Process any candles completed since last call."""
+    def _on_interval(self):
+        """Called every ~100ms by Bookmap. Process any finished candles and run strategy."""
         if self.strategy is None or not self._pending_candles:
             return
 
@@ -293,34 +361,23 @@ class BookmapAddon:
 
         for sig in fresh:
             self._draw_signal(sig)
-            self._update_pnl(sig)
 
     # ------------------------------------------------------------------
     # Drawing helpers
     # ------------------------------------------------------------------
 
     def _draw_signal(self, signal: Signal) -> None:
+        """Draw a signal marker on the Bookmap heatmap."""
         import bookmap as bm
 
-        if self._indicator_heatmap is None or self._alias is None:
+        if self._indicator_signal_id is None or self._alias is None or self._addon is None:
             return
 
-        ts_ms = int(signal.timestamp.timestamp() * 1000)
+        # add_point takes: (addon, alias, indicator_id, point_value)
+        # point_value is the price level on the indicator
         price_level = signal.price / self._pips
 
-        if signal.signal_type == SignalType.ENTRY:
-            color = GREEN if signal.side == Side.LONG else RED
-        else:
-            color = WHITE
-
-        bm.add_point(
-            self._addon,
-            self._indicator_heatmap,
-            self._alias,
-            ts_ms,
-            price_level,
-            color,
-        )
+        bm.add_point(self._addon, self._alias, self._indicator_signal_id, price_level)
 
         logger.info(
             "Signal: %s %s @ %.2f (%s)",
@@ -328,22 +385,4 @@ class BookmapAddon:
             signal.side.value,
             signal.price,
             signal.reason,
-        )
-
-    def _update_pnl(self, signal: Signal) -> None:
-        """Track cumulative PnL line on the bottom subchart."""
-        import bookmap as bm
-
-        if self._indicator_pnl is None or self._alias is None:
-            return
-
-        ts_ms = int(signal.timestamp.timestamp() * 1000)
-
-        bm.add_point(
-            self._addon,
-            self._indicator_pnl,
-            self._alias,
-            ts_ms,
-            0,  # PnL level placeholder — real PnL needs position tracking
-            CYAN,
         )

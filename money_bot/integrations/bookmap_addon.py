@@ -293,11 +293,18 @@ class BookmapAddon:
             logger.info("PnL indicator registered: id=%d", indicator_id)
 
     def _on_setting_change(self, addon, alias, setting_name, field_type, new_value):
-        """Called when user changes a setting in Bookmap UI."""
-        logger.info("Setting changed: %s = %s (%s)", setting_name, new_value, field_type)
+        """Called when user changes a setting in Bookmap UI.
+
+        Note: Bookmap's string settings have a bug where defaults show as "1"/"0".
+        We ignore bogus values and only apply valid ones.
+        """
+        logger.debug("Setting changed: %s = %r (%s)", setting_name, new_value, field_type)
 
         if setting_name == "Candle Interval (sec)":
-            self.interval_seconds = int(new_value)
+            val = int(new_value)
+            if val < 10:
+                return
+            self.interval_seconds = val
             self.aggregator = CandleAggregator(self.interval_seconds)
             self.buffer = CandleBuffer(self.max_candles)
             self._pending_candles.clear()
@@ -305,29 +312,43 @@ class BookmapAddon:
             logger.info("Interval changed to %ds — buffers reset", self.interval_seconds)
 
         elif setting_name == "Strategy Name":
-            self.strategy_name = str(new_value)
+            name = str(new_value).strip()
+            if len(name) < 3 or "_" not in name:
+                # Ignore bogus values like "1" from Bookmap's string default bug
+                return
             try:
-                cls = get_strategy_class(self.strategy_name)
+                cls = get_strategy_class(name)
+                self.strategy_name = name
                 self.strategy = cls.from_params(self.strategy_params)
                 self._prev_signal_count = 0
                 logger.info("Strategy changed to: %s", self.strategy_name)
             except KeyError:
-                logger.error("Unknown strategy: %s", self.strategy_name)
+                logger.warning("Unknown strategy: %s — keeping %s", name, self.strategy_name)
 
         elif setting_name == "Max Candles Buffer":
-            self.max_candles = int(new_value)
+            val = int(new_value)
+            if val < 10:
+                return
+            self.max_candles = val
             self.buffer = CandleBuffer(self.max_candles)
             self._prev_signal_count = 0
 
         elif setting_name == "Strategy Params JSON":
+            raw = str(new_value).strip()
+            if not raw.startswith("{"):
+                # Ignore bogus values like "1" from Bookmap's string default bug
+                return
             try:
-                self.strategy_params = json.loads(str(new_value))
+                params = json.loads(raw)
+                if not isinstance(params, dict):
+                    return
+                self.strategy_params = params
                 cls = get_strategy_class(self.strategy_name)
                 self.strategy = cls.from_params(self.strategy_params)
                 self._prev_signal_count = 0
                 logger.info("Strategy params updated: %s", self.strategy_params)
             except (json.JSONDecodeError, KeyError) as exc:
-                logger.error("Failed to update params: %s", exc)
+                logger.warning("Failed to update params: %s", exc)
 
     def _on_trade(self, addon, alias, price, size, is_otc, is_bid, is_execution_start,
                   is_execution_end, aggressor_order_id, passive_order_id):

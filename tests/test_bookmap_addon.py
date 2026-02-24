@@ -207,3 +207,37 @@ class TestBookmapAddonInit:
     def test_pending_candles_initially_empty(self):
         addon = BookmapAddon("double_ema")
         assert addon._pending_candles == []
+
+    def test_pnl_tracking_initial_state(self):
+        addon = BookmapAddon("double_ema")
+        assert addon._cumulative_pnl == 0.0
+        assert addon._last_entry is None
+
+    def test_indicator_ids_initially_none(self):
+        addon = BookmapAddon("double_ema")
+        assert addon._indicator_long_id is None
+        assert addon._indicator_short_id is None
+        assert addon._indicator_exit_id is None
+        assert addon._indicator_pnl_id is None
+
+    def test_reset_state_clears_all(self):
+        addon = BookmapAddon("double_ema")
+        # Simulate some accumulated state
+        addon._prev_signal_count = 10
+        addon._cumulative_pnl = 500.0
+        addon._last_entry = Signal(
+            pd.Timestamp("2024-01-01", tz="UTC"), SignalType.ENTRY, Side.LONG, 100.0,
+        )
+        addon._pending_candles.append({"fake": True})
+        addon.buffer.append({
+            "timestamp": pd.Timestamp("2024-01-01", tz="UTC"),
+            "open": 100.0, "high": 101.0, "low": 99.0, "close": 100.5, "volume": 1.0,
+        })
+
+        addon._reset_state()
+
+        assert addon._prev_signal_count == 0
+        assert addon._cumulative_pnl == 0.0
+        assert addon._last_entry is None
+        assert len(addon._pending_candles) == 0
+        assert len(addon.buffer) == 0

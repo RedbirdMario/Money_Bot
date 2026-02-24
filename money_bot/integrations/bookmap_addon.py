@@ -25,8 +25,10 @@ COLOR_WHITE = (255, 255, 255)
 COLOR_CYAN = (0, 204, 204)
 
 # Indicator request IDs (arbitrary, used to map responses)
-REQ_SIGNAL_INDICATOR = 1
-REQ_PNL_INDICATOR = 2
+REQ_SIGNAL_LONG = 1
+REQ_SIGNAL_SHORT = 2
+REQ_SIGNAL_EXIT = 3
+REQ_PNL_INDICATOR = 4
 
 # ---------------------------------------------------------------------------
 # CandleAggregator — builds OHLCV candles from individual trade ticks
@@ -133,6 +135,9 @@ class CandleBuffer:
 class BookmapAddon:
     """Bookmap Python addon that runs a Money_Bot strategy on live trade data.
 
+    Registers 3 PRIMARY indicators (Long=green, Short=red, Exit=white) for
+    color-differentiated signal markers, plus 1 BOTTOM indicator for cumulative PnL.
+
     Usage::
 
         addon = BookmapAddon("double_ema", {"fast_period": 20, "slow_period": 155})
@@ -164,14 +169,19 @@ class BookmapAddon:
         # Signal tracking for diff logic
         self._prev_signal_count: int = 0
 
+        # PnL tracking
+        self._last_entry: Signal | None = None
+        self._cumulative_pnl: float = 0.0
+
         # Bookmap handles
-        self._addon: dict | None = None
+        self._addon: Any = None
         self._alias: str | None = None
         self._pips: float = 1.0
-        self._indicator_signal_id: int | None = None
+        # Indicator IDs (resolved async after registration)
+        self._indicator_long_id: int | None = None
+        self._indicator_short_id: int | None = None
+        self._indicator_exit_id: int | None = None
         self._indicator_pnl_id: int | None = None
-        # Map req_id -> resolved indicator_id
-        self._indicator_ids: dict[int, int] = {}
 
     # ------------------------------------------------------------------
     # Public API
@@ -217,11 +227,8 @@ class BookmapAddon:
         self._alias = alias
         self._pips = pips
 
-        # Reset state for new instrument
-        self.aggregator = CandleAggregator(self.interval_seconds)
-        self.buffer = CandleBuffer(self.max_candles)
-        self._pending_candles.clear()
-        self._prev_signal_count = 0
+        # Reset all state for new instrument
+        self._reset_state()
 
         # Load strategy
         cls = get_strategy_class(self.strategy_name)
@@ -248,16 +255,35 @@ class BookmapAddon:
             default_value=json.dumps(self.strategy_params),
         )
 
-        # Register indicators (response comes async via _on_indicator_response)
+        # Register signal indicators — 3 separate for distinct colors on the heatmap
         bm.register_indicator(
             addon, alias,
-            req_id=REQ_SIGNAL_INDICATOR,
-            indicator_name=f"MB:{self.strategy_name}",
+            req_id=REQ_SIGNAL_LONG,
+            indicator_name=f"MB:{self.strategy_name} Long",
             graph_type="PRIMARY",
             color=COLOR_GREEN,
             line_style="SOLID",
             show_line_by_default=True,
         )
+        bm.register_indicator(
+            addon, alias,
+            req_id=REQ_SIGNAL_SHORT,
+            indicator_name=f"MB:{self.strategy_name} Short",
+            graph_type="PRIMARY",
+            color=COLOR_RED,
+            line_style="SOLID",
+            show_line_by_default=True,
+        )
+        bm.register_indicator(
+            addon, alias,
+            req_id=REQ_SIGNAL_EXIT,
+            indicator_name=f"MB:{self.strategy_name} Exit",
+            graph_type="PRIMARY",
+            color=COLOR_WHITE,
+            line_style="SOLID",
+            show_line_by_default=True,
+        )
+        # Cumulative PnL subchart
         bm.register_indicator(
             addon, alias,
             req_id=REQ_PNL_INDICATOR,
@@ -284,10 +310,15 @@ class BookmapAddon:
 
     def _on_indicator_response(self, addon, req_id, indicator_id):
         """Bookmap confirms indicator registration with the real indicator_id."""
-        self._indicator_ids[req_id] = indicator_id
-        if req_id == REQ_SIGNAL_INDICATOR:
-            self._indicator_signal_id = indicator_id
-            logger.info("Signal indicator registered: id=%d", indicator_id)
+        if req_id == REQ_SIGNAL_LONG:
+            self._indicator_long_id = indicator_id
+            logger.info("Long indicator registered: id=%d", indicator_id)
+        elif req_id == REQ_SIGNAL_SHORT:
+            self._indicator_short_id = indicator_id
+            logger.info("Short indicator registered: id=%d", indicator_id)
+        elif req_id == REQ_SIGNAL_EXIT:
+            self._indicator_exit_id = indicator_id
+            logger.info("Exit indicator registered: id=%d", indicator_id)
         elif req_id == REQ_PNL_INDICATOR:
             self._indicator_pnl_id = indicator_id
             logger.info("PnL indicator registered: id=%d", indicator_id)
@@ -305,10 +336,7 @@ class BookmapAddon:
             if val < 10:
                 return
             self.interval_seconds = val
-            self.aggregator = CandleAggregator(self.interval_seconds)
-            self.buffer = CandleBuffer(self.max_candles)
-            self._pending_candles.clear()
-            self._prev_signal_count = 0
+            self._reset_state()
             logger.info("Interval changed to %ds — buffers reset", self.interval_seconds)
 
         elif setting_name == "Strategy Name":
@@ -321,6 +349,7 @@ class BookmapAddon:
                 self.strategy_name = name
                 self.strategy = cls.from_params(self.strategy_params)
                 self._prev_signal_count = 0
+                self._last_entry = None
                 logger.info("Strategy changed to: %s", self.strategy_name)
             except KeyError:
                 logger.warning("Unknown strategy: %s — keeping %s", name, self.strategy_name)
@@ -346,6 +375,7 @@ class BookmapAddon:
                 cls = get_strategy_class(self.strategy_name)
                 self.strategy = cls.from_params(self.strategy_params)
                 self._prev_signal_count = 0
+                self._last_entry = None
                 logger.info("Strategy params updated: %s", self.strategy_params)
             except (json.JSONDecodeError, KeyError) as exc:
                 logger.warning("Failed to update params: %s", exc)
@@ -391,22 +421,55 @@ class BookmapAddon:
     # ------------------------------------------------------------------
 
     def _draw_signal(self, signal: Signal) -> None:
-        """Draw a signal marker on the Bookmap heatmap."""
+        """Draw a signal marker on the Bookmap heatmap and update PnL."""
         import bookmap as bm
 
-        if self._indicator_signal_id is None or self._alias is None or self._addon is None:
+        if self._alias is None or self._addon is None:
             return
 
-        # add_point takes: (addon, alias, indicator_id, point_value)
-        # point_value is the price level on the indicator
         price_level = signal.price / self._pips
 
-        bm.add_point(self._addon, self._alias, self._indicator_signal_id, price_level)
+        # Route to the correct color-coded indicator
+        if signal.signal_type == SignalType.ENTRY:
+            self._last_entry = signal
+            if signal.side == Side.LONG and self._indicator_long_id is not None:
+                bm.add_point(self._addon, self._alias, self._indicator_long_id, price_level)
+            elif signal.side == Side.SHORT and self._indicator_short_id is not None:
+                bm.add_point(self._addon, self._alias, self._indicator_short_id, price_level)
+
+        elif signal.signal_type == SignalType.EXIT:
+            if self._indicator_exit_id is not None:
+                bm.add_point(self._addon, self._alias, self._indicator_exit_id, price_level)
+
+            # Update cumulative PnL on exit
+            if self._last_entry is not None:
+                if self._last_entry.side == Side.LONG:
+                    pnl = signal.price - self._last_entry.price
+                else:
+                    pnl = self._last_entry.price - signal.price
+                self._cumulative_pnl += pnl
+                self._last_entry = None
+
+                if self._indicator_pnl_id is not None:
+                    bm.add_point(
+                        self._addon, self._alias, self._indicator_pnl_id,
+                        self._cumulative_pnl,
+                    )
 
         logger.info(
-            "Signal: %s %s @ %.2f (%s)",
+            "Signal: %s %s @ %.2f (%s) | PnL: %.2f",
             signal.signal_type.value,
             signal.side.value,
             signal.price,
             signal.reason,
+            self._cumulative_pnl,
         )
+
+    def _reset_state(self) -> None:
+        """Reset all stateful components (on settings change or new instrument)."""
+        self.aggregator = CandleAggregator(self.interval_seconds)
+        self.buffer = CandleBuffer(self.max_candles)
+        self._pending_candles.clear()
+        self._prev_signal_count = 0
+        self._last_entry = None
+        self._cumulative_pnl = 0.0
